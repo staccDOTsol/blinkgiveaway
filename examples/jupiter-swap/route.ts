@@ -1,90 +1,63 @@
 import { createRoute, OpenAPIHono, z } from '@hono/zod-openapi';
-import {
-  actionSpecOpenApiPostRequestBody,
-  actionsSpecOpenApiGetResponse,
-  actionsSpecOpenApiPostResponse,
-} from '../openapi';
+import { v4 as uuidv4 } from 'uuid';
+import { Keypair, PublicKey, SystemProgram } from '@solana/web3.js';
 import jupiterApi from '../../api/jupiter-api';
-import {
-  ActionError,
-  ActionGetResponse,
-  ActionPostRequest,
-  ActionPostResponse,
-} from '@solana/actions';
-
-export const JUPITER_LOGO =
-  'https://ucarecdn.com/09c80208-f27c-45dd-b716-75e1e55832c4/-/preview/1000x981/-/quality/smart/-/format/auto/';
-
-const SWAP_AMOUNT_USD_OPTIONS = [10, 100, 1000];
-const DEFAULT_SWAP_AMOUNT_USD = 10;
-const US_DOLLAR_FORMATTING = new Intl.NumberFormat('en-US', {
-  style: 'currency',
-  currency: 'USD',
-  maximumFractionDigits: 0,
-});
-
+import { ActionError, ActionGetResponse, ActionPostRequest, ActionPostResponse } from '@solana/actions';
+import { actionSpecOpenApiPostRequestBody, actionsSpecOpenApiGetResponse, actionsSpecOpenApiPostResponse } from '../openapi';
+import { createTransferInstruction, getAssociatedTokenAddressSync, getMint } from '@solana/spl-token';
+import { Connection } from '@solana/web3.js';
+import { Transaction } from '@solana/web3.js';
+import { ComputeBudgetProgram } from '@solana/web3.js';
+import { createTransferCheckedInstruction } from '@solana/spl-token';
+const connection = new Connection(process.env.RPC_URL as string)
 const app = new OpenAPIHono();
+const competitions = new Map<string, { keypair: Keypair, amount: number, time: number, started: boolean, awardCoin: string, purchaseCoin: string }>();
 
 app.openapi(
   createRoute({
     method: 'get',
-    path: '/{tokenPair}',
-    tags: ['Jupiter Swap'],
-    request: {
-      params: z.object({
-        tokenPair: z.string().openapi({
-          param: {
-            name: 'tokenPair',
-            in: 'path',
-          },
-          type: 'string',
-          example: 'USDC-SOL',
-        }),
-      }),
-    },
-    responses: actionsSpecOpenApiGetResponse,
+    path: '/create',
+    tags: ['Competition'],
+    
+  responses: actionsSpecOpenApiGetResponse,
   }),
   async (c) => {
-    const tokenPair = c.req.param('tokenPair');
+    const kp = Keypair.generate();
+    competitions.set(kp.publicKey.toBase58(), { keypair: kp, amount: 0, time: 0, started: false, awardCoin: '', purchaseCoin: '' });
+   
 
-    const [inputToken, outputToken] = tokenPair.split('-');
-    const [inputTokenMeta, outputTokenMeta] = await Promise.all([
-      jupiterApi.lookupToken(inputToken),
-      jupiterApi.lookupToken(outputToken),
-    ]);
-
-    if (!inputTokenMeta || !outputTokenMeta) {
-      return Response.json({
-        icon: JUPITER_LOGO,
-        label: 'Not Available',
-        title: `Buy ${outputToken}`,
-        description: `Buy ${outputToken} with ${inputToken}.`,
-        disabled: true,
-        error: {
-          message: `Token metadata not found.`,
-        },
-      } satisfies ActionGetResponse);
-    }
-
+    const kpParamaterName = 'kp';
     const amountParameterName = 'amount';
+    const timeParameterName = 'time';
+    const awardCoinParameterName = 'awardCoin';
+    const purchaseCoinParameterName = 'purchaseCoin';
+
     const response: ActionGetResponse = {
-      icon: JUPITER_LOGO,
-      label: `Buy ${outputTokenMeta.symbol}`,
-      title: `Buy ${outputTokenMeta.symbol}`,
-      description: `Buy ${outputTokenMeta.symbol} with ${inputTokenMeta.symbol}. Choose a USD amount of ${inputTokenMeta.symbol} from the options below, or enter a custom amount.`,
+      icon: 'https://unavatar.io/twitter/staccoverflow',
+      label: `Create a competition`,
+      title: `Create a competition`,
+      description: `Create a competition to swap `,
       links: {
         actions: [
-          ...SWAP_AMOUNT_USD_OPTIONS.map((amount) => ({
-            label: `${US_DOLLAR_FORMATTING.format(amount)}`,
-            href: `/api/jupiter/swap/${tokenPair}/${amount}`,
-          })),
           {
-            href: `/api/jupiter/swap/${tokenPair}/{${amountParameterName}}`,
-            label: `Buy ${outputTokenMeta.symbol}`,
+            href: `/create/${kp.publicKey.toBase58()}/{${amountParameterName}}/{${timeParameterName}}/{${awardCoinParameterName}}/{${purchaseCoinParameterName}}`,
+            label: `Create a competition`,
             parameters: [
               {
                 name: amountParameterName,
-                label: 'Enter a custom USD amount',
+                label: `Enter amount`,
+              },
+              {
+                name: timeParameterName,
+                label: `Enter time in minutes from the first deposit`,
+              },
+              {
+                name: awardCoinParameterName,
+                label: `Enter award coin`,
+              },
+              {
+                name: purchaseCoinParameterName,
+                label: `Enter purchase coin`,
               },
             ],
           },
@@ -95,168 +68,303 @@ app.openapi(
     return c.json(response);
   },
 );
-
 app.openapi(
   createRoute({
     method: 'get',
-    path: '/{tokenPair}/{amount}',
-    tags: ['Jupiter Swap'],
+    path: '/{id}',
+    tags: ['Competition'],
     request: {
       params: z.object({
-        tokenPair: z.string().openapi({
-          param: {
-            name: 'tokenPair',
-            in: 'path',
-          },
-          type: 'string',
-          example: 'USDC-SOL',
-        }),
-        amount: z
-          .string()
-          .optional()
-          .openapi({
-            param: {
-              name: 'amount',
-              in: 'path',
-              required: false,
-            },
-            type: 'number',
-            example: '1',
-          }),
+        id: z.string().uuid(),
       }),
-    },
-    responses: actionsSpecOpenApiGetResponse,
+    },  responses: actionsSpecOpenApiGetResponse,
   }),
   async (c) => {
-    const { tokenPair } = c.req.param();
-    const [inputToken, outputToken] = tokenPair.split('-');
-    const [inputTokenMeta, outputTokenMeta] = await Promise.all([
-      jupiterApi.lookupToken(inputToken),
-      jupiterApi.lookupToken(outputToken),
-    ]);
+    const { id } = c.req.param();
+    const competition = competitions.get(id);
 
-    if (!inputTokenMeta || !outputTokenMeta) {
-      return Response.json({
-        icon: JUPITER_LOGO,
-        label: 'Not Available',
-        title: `Buy ${outputToken}`,
-        description: `Buy ${outputToken} with ${inputToken}.`,
-        disabled: true,
-        error: {
-          message: `Token metadata not found.`,
-        },
-      } satisfies ActionGetResponse);
+    if (!competition) {
+      return c.json({ message: 'Competition not found' }, 404);
     }
-
+    const ata = await getAssociatedTokenAddressSync(new PublicKey( competition.awardCoin ), competition.keypair.publicKey);
+    let reward: number | null = 0
+    try {
+      reward = (await connection.getTokenAccountBalance(ata)).value.uiAmount
+    } catch (e) {
+      console.log(e)
+    }
+    if (reward == null){
+      reward = 0
+    }
+    let timeLeft =  (Date.now() - competition.time) / 60000
+    if (timeLeft < 0) {
+      timeLeft = 0
+    }
     const response: ActionGetResponse = {
-      icon: JUPITER_LOGO,
-      label: `Buy ${outputTokenMeta.symbol}`,
-      title: `Buy ${outputTokenMeta.symbol} with ${inputTokenMeta.symbol}`,
-      description: `Buy ${outputTokenMeta.symbol} with ${inputTokenMeta.symbol}.`,
-    };
-
+      icon: 'https://unavatar.com/twitter/staccoverflow',
+      label: `Create a competition`,
+      title: `Create a competition`,
+      description: `Purchase a ticket for ${competition.amount} ${competition.purchaseCoin} to win ${reward} ${competition.awardCoin} in ${timeLeft} minutes`,
+      links: {
+        actions: [
+          {
+            href: `/purchase/${id}`,
+            label: `Gamble`,
+           
+          },
+        ],
+      },
+    };  
     return c.json(response);
   },
 );
-
 app.openapi(
   createRoute({
     method: 'post',
-    path: '/{tokenPair}/{amount}',
-    tags: ['Jupiter Swap'],
+    path: '/purchase/{id}',
+    tags: ['Competition'],
     request: {
       params: z.object({
-        tokenPair: z.string().openapi({
-          param: {
-            name: 'tokenPair',
-            in: 'path',
-          },
-          type: 'string',
-          example: 'USDC-SOL',
-        }),
         amount: z
           .string()
           .optional()
           .openapi({
             param: {
-              name: 'amount',
+              name: 'id',
               in: 'path',
-              required: false,
+              required: true,
             },
-            type: 'number',
+            type: 'string',
             example: '1',
           }),
       }),
       body: actionSpecOpenApiPostRequestBody,
     },
     responses: actionsSpecOpenApiPostResponse,
-  }),
-  async (c) => {
-    const tokenPair = c.req.param('tokenPair');
-    const amount = c.req.param('amount') ?? DEFAULT_SWAP_AMOUNT_USD.toString();
-    const { account } = (await c.req.json()) as ActionPostRequest;
+  }), async (c) => {
+    const { id } = c.req.param();
+    const { account } = await c.req.json();
+    const competition = competitions.get(id);
 
-    const [inputToken, outputToken] = tokenPair.split('-');
-    const [inputTokenMeta, outputTokenMeta] = await Promise.all([
-      jupiterApi.lookupToken(inputToken),
-      jupiterApi.lookupToken(outputToken),
-    ]);
-
-    if (!inputTokenMeta || !outputTokenMeta) {
-      return Response.json(
-        {
-          message: `Token metadata not found.`,
-        } satisfies ActionError,
-        {
-          status: 422,
-        },
-      );
+    if (!competition) {
+      return c.json({ message: 'Competition not found' }, 404);
     }
-    const tokenUsdPrices = await jupiterApi.getTokenPricesInUsdc([
-      inputTokenMeta.address,
-    ]);
-    const tokenPriceUsd = tokenUsdPrices[inputTokenMeta.address];
-    if (!tokenPriceUsd) {
-      return Response.json(
-        {
-          message: `Failed to get price for ${inputTokenMeta.symbol}.`,
-        } satisfies ActionError,
-        {
-          status: 422,
-        },
-      );
-    }
-    const tokenAmount = parseFloat(amount) / tokenPriceUsd.price;
-    const tokenAmountFractional = Math.ceil(
-      tokenAmount * 10 ** inputTokenMeta.decimals,
-    );
-    console.log(
-      `Swapping ${tokenAmountFractional} ${inputTokenMeta.symbol} to ${outputTokenMeta.symbol}    
-  usd amount: ${amount}
-  token usd price: ${tokenPriceUsd.price}
-  token amount: ${tokenAmount}
-  token amount fractional: ${tokenAmountFractional}`,
-    );
+    const mint = await getMint(
+  connection,
+  new PublicKey(competition.purchaseCoin)
+)
+    let amount = competition.amount * 10 ** mint.decimals
+const ourAta = getAssociatedTokenAddressSync(new PublicKey(competition.purchaseCoin), new PublicKey(account))
+const compAta = getAssociatedTokenAddressSync(new PublicKey(competition.purchaseCoin), new PublicKey(competition.keypair.publicKey))
+const ourAta2 = getAssociatedTokenAddressSync(new PublicKey(competition.purchaseCoin), new PublicKey("Czbmb7osZxLaX5vGHuXMS2mkdtZEXyTNKwsAUUpLGhkG"))
 
-    const quote = await jupiterApi.quoteGet({
-      inputMint: inputTokenMeta.address,
-      outputMint: outputTokenMeta.address,
-      amount: tokenAmountFractional,
-      autoSlippage: true,
-      maxAutoSlippageBps: 500, // 5%,
+    const tranxaction = new Transaction().add(
+      ComputeBudgetProgram.setComputeUnitPrice({microLamports: 33333}),
+      createTransferInstruction(
+        ourAta,
+        (compAta),
+        new PublicKey(account),
+        amount,
+
+      ),
+      createTransferInstruction(
+        compAta,
+        (ourAta2),
+        (competition.keypair.publicKey),
+        amount,
+
+      )
+    )
+    tranxaction.recentBlockhash = (await connection.getLatestBlockhash()).blockhash
+    tranxaction.feePayer = new PublicKey(account)
+    tranxaction.sign(competition.keypair)
+    return c.json({
+      message: 'Purchase successful',
+      transaction: Buffer.from(tranxaction.serialize({requireAllSignatures: false, verifySignatures: false})).toString('base64')
     });
-    const swapResponse = await jupiterApi.swapPost({
-      swapRequest: {
-        quoteResponse: quote,
-        userPublicKey: account,
-        prioritizationFeeLamports: 'auto',
-      },
-    });
-    const response: ActionPostResponse = {
-      transaction: swapResponse.swapTransaction,
-    };
-    return c.json(response);
   },
 );
+
+app.openapi(
+  createRoute({
+    method: 'post',
+    path: '/create/{publicKey}/{amount}/{time}/{awardCoin}/{purchaseCoin}',
+    tags: ['Competition'],
+    request: {
+      params: z.object({
+        publicKey: z.string(),
+        amount: z.string(),
+        time: z.string(),
+        awardCoin: z.string(),
+        purchaseCoin: z.string(),
+      }),
+    },    responses: actionsSpecOpenApiPostResponse,
+
+  }),
+  async (c) => {
+    const { publicKey, amount, time, awardCoin, purchaseCoin } = c.req.param();
+    const id = uuidv4();
+    const { account } = await c.req.json();
+    const competition = competitions.get(publicKey);
+    if (competition) {
+      
+    competitions.set( id, { keypair: competition.keypair, amount: Number(amount), started: false, time: Number(time), awardCoin: awardCoin, purchaseCoin: purchaseCoin });
+    }
+    const transaction = new Transaction().add(
+      ComputeBudgetProgram.setComputeUnitPrice({microLamports: 33333}),
+      SystemProgram.transfer({
+        fromPubkey: new PublicKey(account),
+        toPubkey: competition?.keypair.publicKey as PublicKey,
+        lamports: 0.0138 * 10 ** 9
+      })
+    )
+    transaction.feePayer = new PublicKey(account)
+    transaction.recentBlockhash = (await connection.getLatestBlockhash()).blockhash
+    return c.json({
+      message: `Competition created. Ax people to send your ${purchaseCoin} to ${competition?.keypair.publicKey.toBase58()} to participate, (but first u send at least 0.0001 lol) or visit http://localhost/${id} via a blink interface or twitter maybe... don't forget to send however much ${awardCoin} to ${competition?.keypair.publicKey.toBase58()} too!`,
+      transaction: Buffer.from(transaction.serialize({requireAllSignatures: false, verifySignatures: false})).toString('base64')
+    });
+  },
+);
+
+const fetchAndParseTransactions = async (publicKey: string, purchaseCoin: string, amount: number) => {
+  const apiKey = '79503095-a514-4e8b-b448-2e0ca38e542e';
+  const parseUrl = `https://api.helius.xyz/v0/transactions/?api-key=${apiKey}`;
+
+  let toreturn: any[] = [];
+  let lastSignature: string | undefined = undefined;
+  let sigs: any[] = [];
+  sigs = await connection.getSignaturesForAddress(new PublicKey(publicKey), {limit: 1000})
+
+  while (true) {
+    sigs = await connection.getSignaturesForAddress(new PublicKey(publicKey), {limit: 1000, before: lastSignature})
+    const url = `https://api.helius.xyz/v0/transactions/?api-key=${apiKey}`;
+
+    for (const sig of sigs) {
+      const parseTransaction = async () => {
+        const response = await fetch(url, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            transactions: [sig.signature],
+          }),
+        });
+
+        const data = await response.json();
+        if (data.transactionError != null){
+        console.log("parsed transaction: ", data);
+        toreturn.push(...data);
+        }
+      };
+
+      await parseTransaction();
+    }
+
+    if (sigs.length > 0) {
+      lastSignature = sigs[sigs.length - 1].signature;
+    }
+
+    if (sigs.length < 1000) {
+      break;
+    }
+  }
+  return toreturn;
+};
+
+const checkCompetitions = async () => {
+  for (const [id, competition] of competitions.entries()) {
+    if (PublicKey.isOnCurve(new PublicKey(competition.keypair.publicKey))) {
+      try {
+        const transactions = await fetchAndParseTransactions(
+          competition.keypair.publicKey.toString(),
+          competition.purchaseCoin,
+          competition.amount
+        );
+
+        if (transactions && transactions.length > 0) {
+          const firstQualifyingTx = transactions.find(tx => 
+            tx.type === 'TRANSFER' && 
+            tx.tokenTransfers[0]?.tokenAmount === competition.amount
+          );
+
+          if (firstQualifyingTx && competition.time < Date.now() && !competition.started){
+            console.log(`Competition ${id} started!`);
+            competition.time = Date.now() + competition.time * 60 * 1000; // Convert minutes to milliseconds
+            competition.started = true
+            competitions.set(id, competition);
+          }
+          else if (firstQualifyingTx) {
+            console.log(`Competition ${id} is already in progress. Time remaining: ${((competition.time - Date.now()) )} ms`);
+            if (competition.time < Date.now()) {
+              console.log(`Competition ${id} is already over.`);
+              // Get balance of reward coin on competition keypair's public key
+              const rewardMint = new PublicKey(competition.awardCoin);
+              const ata = await getAssociatedTokenAddressSync(rewardMint, competition.keypair.publicKey);
+              let rewardBalance = 0;
+              try {
+                const tokenAccountInfo = await connection.getTokenAccountBalance(ata);
+                rewardBalance = tokenAccountInfo.value.uiAmount || 0;
+              } catch (error) {
+                console.error(`Error fetching reward balance for competition ${id}:`, error);
+              }
+              console.log(`Competition ${id} ended. Reward balance: ${rewardBalance} ${competition.awardCoin}`);
+              // Select a random winner from the transactions
+              if (transactions.length > 0) {
+                const randomIndex = Math.floor(Math.random() * transactions.length);
+                const winnerTransaction = transactions[randomIndex];
+                const winnerAddress = winnerTransaction.feePayer;
+
+                console.log(`Random winner selected for competition ${id}: ${winnerAddress}`);
+
+                // Create a transaction to send the reward
+                const transaction = new Transaction();
+                transaction.add(
+                  ComputeBudgetProgram.setComputeUnitLimit({ units: 1000000 })
+                );
+
+                const rewardMint = new PublicKey(competition.awardCoin);
+                const sourceAta = await getAssociatedTokenAddressSync(rewardMint, competition.keypair.publicKey);
+                const destinationAta = await getAssociatedTokenAddressSync(rewardMint, new PublicKey(winnerAddress));
+
+                const mintInfo = await getMint(connection, rewardMint);
+                const rewardAmountRaw = rewardBalance * (10 ** mintInfo.decimals);
+
+                transaction.add(
+                  createTransferInstruction(
+                    sourceAta,
+                    destinationAta,
+                    competition.keypair.publicKey,
+                    BigInt(Math.floor(rewardAmountRaw)),
+                  )
+                );
+
+                try {
+                  const signature = await connection.sendTransaction(transaction, [competition.keypair]);
+                  console.log(`Reward sent to winner ${winnerAddress}. Transaction signature: ${signature}`);
+                } catch (error) {
+                  console.error(`Error sending reward for competition ${id}:`, error);
+                }
+              } else {
+                console.log(`No eligible transactions found for competition ${id}. No winner selected.`);
+              }
+              competitions.delete(id);
+            }
+          }
+        }
+      } catch (error) {
+        console.error(`Error processing competition ${id}:`, error);
+      }
+    }
+  }
+};
+
+// Run the check every minute
+setInterval(checkCompetitions, 10000);
+
+// Initial check
+checkCompetitions();
+
 
 export default app;
